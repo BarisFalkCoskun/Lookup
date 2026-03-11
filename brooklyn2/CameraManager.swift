@@ -20,6 +20,7 @@ final class CameraManager: NSObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private let processingQueue = DispatchQueue(label: "com.brooklyn2.processing", qos: .userInteractive)
     private let ciContext = CIContext()
+    private var sessionConfigured = false
 
     // Vision requests
     private let segmentationRequest: VNGeneratePersonSegmentationRequest = {
@@ -46,6 +47,8 @@ final class CameraManager: NSObject {
     }
 
     private func configureSession() {
+        guard !sessionConfigured else { return }
+
         captureSession.beginConfiguration()
         captureSession.sessionPreset = .hd1280x720
 
@@ -79,6 +82,7 @@ final class CameraManager: NSObject {
         }
 
         captureSession.commitConfiguration()
+        sessionConfigured = true
     }
 
     private func processFrame(_ sampleBuffer: CMSampleBuffer) {
@@ -95,17 +99,18 @@ final class CameraManager: NSObject {
         // Check for face detection
         let hasFace = !(faceDetectionRequest.results?.isEmpty ?? true)
 
-        // Get segmentation mask
-        guard let maskBuffer = segmentationRequest.results?.first?.pixelBuffer else { return }
-
-        // Composite
         let originalImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let maskImage = CIImage(cvPixelBuffer: maskBuffer)
+        let compositedImage: CIImage
 
-        guard let compositedImage = compositeB99Effect(person: originalImage, mask: maskImage) else { return }
+        if let maskBuffer = segmentationRequest.results?.first?.pixelBuffer {
+            let maskImage = CIImage(cvPixelBuffer: maskBuffer)
+            compositedImage = compositeB99Effect(person: originalImage, mask: maskImage) ?? stylizedScene(from: originalImage)
+        } else {
+            compositedImage = stylizedScene(from: originalImage)
+        }
 
         // Render to CGImage
-        guard let cgImage = ciContext.createCGImage(compositedImage, from: originalImage.extent) else { return }
+        guard let cgImage = ciContext.createCGImage(compositedImage, from: compositedImage.extent) else { return }
 
         Task { @MainActor in
             self.currentFrame = cgImage
@@ -115,33 +120,95 @@ final class CameraManager: NSObject {
 
     private func compositeB99Effect(person: CIImage, mask: CIImage) -> CIImage? {
         let extent = person.extent
+        let clear = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: extent)
 
-        // B99 warm orange/amber solid background
-        let background = CIImage(color: CIColor(red: 0.85, green: 0.45, blue: 0.05, alpha: 1.0))
-            .cropped(to: extent)
-
-        // Scale mask to match the original image dimensions
+        // Scale the Vision mask up to the live frame.
         let scaleX = extent.width / mask.extent.width
         let scaleY = extent.height / mask.extent.height
-        let scaledMask = mask.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-
-        // Blend: person on styled background using the segmentation mask
-        let blendFilter = CIFilter.blendWithMask()
-        blendFilter.inputImage = person
-        blendFilter.backgroundImage = background
-        blendFilter.maskImage = scaledMask
-
-        guard let blendedImage = blendFilter.outputImage else { return nil }
-
-        // Apply a warm orange color tint over the whole image (like the B99 intro color grade)
-        let orangeTint = CIImage(color: CIColor(red: 0.9, green: 0.5, blue: 0.1, alpha: 0.25))
+        let scaledMask = mask
+            .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
             .cropped(to: extent)
 
-        let tintedFilter = CIFilter.sourceOverCompositing()
-        tintedFilter.inputImage = orangeTint
-        tintedFilter.backgroundImage = blendedImage
+        let background = stylizedScene(from: person)
+        guard let isolatedSubject = blend(foreground: person, background: clear, mask: scaledMask) else {
+            return background
+        }
 
-        return tintedFilter.outputImage
+        let subjectShadowMask = scaledMask
+            .transformed(by: CGAffineTransform(translationX: 18, y: -8))
+            .clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 18.0])
+            .cropped(to: extent)
+
+        let subjectGlowMask = scaledMask
+            .applyingFilter("CIMorphologyMaximum", parameters: ["inputRadius": 10.0])
+            .clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 10.0])
+            .cropped(to: extent)
+
+        let shadowColor = CIImage(color: CIColor(red: 0.32, green: 0.08, blue: 0.0, alpha: 0.34)).cropped(to: extent)
+        let glowColor = CIImage(color: CIColor(red: 1.0, green: 0.64, blue: 0.24, alpha: 0.22)).cropped(to: extent)
+
+        let shadow = blend(foreground: shadowColor, background: clear, mask: subjectShadowMask)
+        let glow = blend(foreground: glowColor, background: clear, mask: subjectGlowMask)
+
+        let liftedSubject = isolatedSubject
+            .applyingFilter("CIColorControls", parameters: [
+                kCIInputSaturationKey: 1.08,
+                kCIInputContrastKey: 1.1,
+                kCIInputBrightnessKey: 0.02
+            ])
+            .applyingFilter("CISharpenLuminance", parameters: ["inputSharpness": 0.35])
+
+        var composed = background
+
+        if let shadow {
+            composed = shadow.composited(over: composed)
+        }
+
+        if let glow {
+            composed = glow.composited(over: composed)
+        }
+
+        return liftedSubject.composited(over: composed).cropped(to: extent)
+    }
+
+    private func stylizedScene(from image: CIImage) -> CIImage {
+        let extent = image.extent
+        let blurredBase = image
+            .clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 10.0])
+            .cropped(to: extent)
+            .applyingFilter("CIColorControls", parameters: [
+                kCIInputSaturationKey: 0.82,
+                kCIInputContrastKey: 1.16,
+                kCIInputBrightnessKey: -0.03
+            ])
+            .applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: 0.1])
+            .applyingFilter("CIVignette", parameters: [
+                kCIInputIntensityKey: 0.55,
+                kCIInputRadiusKey: max(extent.width, extent.height) * 0.95
+            ])
+
+        let warmWash = CIImage(color: CIColor(red: 1.0, green: 0.49, blue: 0.08, alpha: 0.18))
+            .cropped(to: extent)
+
+        let gradientFilter = CIFilter.linearGradient()
+        gradientFilter.point0 = CGPoint(x: extent.minX, y: extent.maxY * 0.9)
+        gradientFilter.point1 = CGPoint(x: extent.maxX, y: extent.minY)
+        gradientFilter.color0 = CIColor(red: 1.0, green: 0.68, blue: 0.22, alpha: 0.22)
+        gradientFilter.color1 = CIColor(red: 0.55, green: 0.16, blue: 0.02, alpha: 0.34)
+
+        let gradient = (gradientFilter.outputImage ?? warmWash).cropped(to: extent)
+        return warmWash.composited(over: gradient.composited(over: blurredBase)).cropped(to: extent)
+    }
+
+    private func blend(foreground: CIImage, background: CIImage, mask: CIImage) -> CIImage? {
+        let blendFilter = CIFilter.blendWithMask()
+        blendFilter.inputImage = foreground
+        blendFilter.backgroundImage = background
+        blendFilter.maskImage = mask
+        return blendFilter.outputImage?.cropped(to: background.extent)
     }
 }
 
